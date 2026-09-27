@@ -34,7 +34,7 @@ const families=[
   ["XIENCE SIERRA","xience sierra"],["XIENCE ALPINE","xience alpine"],
   ["MINI TREK","mini trek"],["NC TREK NEO","nc trek neo"],["NC TREK","nc trek"],
   ["TREK","trek"],["ARMADA","armada"],["VIATRAC","viatrac"],
-  ["PILOT 50","pilot 50"],["PILOT","pilot"],["BMW","balance middleweight"],
+  ["PILOT 50","pilot 50"],["PILOT 150","pilot 150"],["PILOT 200","pilot 200"],["PILOT","pilot"],["BMW","balance middleweight"],
   ["SUPERA","supera"],["AMPLATZER","amplatzer"]
 ];
 function family(p) {
@@ -128,13 +128,14 @@ function shortName(p){
  const f=family(p),dim=p.name.match(/\b\d+(?:[.,]\d+)?\s*(?:mm)?\s*[x×]\s*\d+\s*mm\b/i);
  const cm=p.name.match(/\b(\d{2,3})\s*cm\b/ig);
  const tip=/\bJ TIP\b/i.test(p.name)?"J uç":/\bSTRAIGHT TIP\b/i.test(p.name)?"Düz uç":"";
- return [f,dim?.[0],cm?.at(-1),tip,p.ref].filter(Boolean).join(" · ").slice(0,64);
+ const variant=/\bWIRELESS\b/i.test(p.name)?"Kablosuz":/\bCABLED\b/i.test(p.name)?"Kablolu":"";
+ return [f,variant,dim?.[0],cm?.at(-1),tip,p.ref].filter(Boolean).join(" · ").slice(0,64);
 }
 async function showPage(chat,page=0){
  const s=await state(chat);if(!s.results.length)return welcome(chat,"Önce bir ürün veya aile ara.");
  const total=Math.ceil(s.results.length/PER_PAGE);s.page=Math.max(0,Math.min(page,total-1));await saveState(chat,s);
  const shown=s.results.slice(s.page*PER_PAGE,(s.page+1)*PER_PAGE).map(e);
- const rows=shown.map(p=>row([`☐ ${shortName(p)}`,`i:${p.i}`]));
+ const rows=shown.map(p=>row([shortName(p),`i:${p.i}`]));
  const nav=[];if(s.page>0)nav.push(["⬅️ Önceki",`pg:${s.page-1}`]);
  if(s.page+1<total)nav.push(["Sonraki ➡️",`pg:${s.page+1}`]);if(nav.length)rows.push(row(...nav));
  rows.push(row([`📋 Seçilenler (${s.selected.length})`,"selected"],["📄 Tümünü listele","list:all"]));
@@ -152,7 +153,7 @@ async function welcome(chat,note=""){
 async function group(chat,kind){
  const names=kind==="balon"?["MINI TREK","TREK","NC TREK","NC TREK NEO","ARMADA","VIATRAC"]:
   kind==="stent"?["XIENCE PROA","XIENCE PROS","XIENCE SIERRA","XIENCE ALPINE","SUPERA"]:
-  ["PILOT 50","PILOT","BMW"];
+  ["PILOT 50","PILOT 150","PILOT 200","BMW"];
  const available=names.filter(n=>byFamily.has(n));
  const rows=[];for(let i=0;i<available.length;i+=2)rows.push(row(...available.slice(i,i+2).map(n=>[`${n} (${byFamily.get(n).length})`,`fam:${n}`])));
  rows.push(row(["⬅️ Geri","home"],["➡️ Geç","skip"]));
