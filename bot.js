@@ -3,6 +3,7 @@ import { sqlite } from "https://esm.town/v/std/sqlite/main.ts";
 import JSZip from "npm:jszip@3.10.1";
 import { PDFDocument, rgb } from "npm:pdf-lib@1.17.1";
 import fontkit from "npm:@pdf-lib/fontkit@1.1.1";
+import ExcelJS from "npm:exceljs@4.4.0";
 
 const TOKEN = Deno.env.get("TELEGRAM_TOKEN");
 const SECRET = Deno.env.get("TELEGRAM_WEBHOOK_SECRET");
@@ -28,7 +29,7 @@ function queryText(input){
   return matches.length===1?matches[0]:token;
  }).join("");
 }
-const entries=products.map((p,i)=>({...p,i,n:normalize(p.name),g:normalize(p.group),r:normalize(p.ref)}));
+let entries=[];
 const families=[
   ["XIENCE PROA","xience proa"],["XIENCE PROS","xience pros"],
   ["XIENCE SIERRA","xience sierra"],["XIENCE ALPINE","xience alpine"],
@@ -41,8 +42,84 @@ function family(p) {
   for(const [label,key] of families) if(p.n.includes(key)) return label;
   return p.n.split(/\s+/).slice(0,2).join(" ").toUpperCase();
 }
-const byFamily=new Map();
-for(const p of entries){const f=family(p);byFamily.set(f,[...(byFamily.get(f)||[]),p]);}
+let byFamily=new Map();
+const catalogTable=sqlite.execute("CREATE TABLE IF NOT EXISTS ozgata_catalog_overrides(ubb TEXT PRIMARY KEY, payload TEXT NOT NULL, created_at TEXT NOT NULL)");
+const pendingTable=sqlite.execute("CREATE TABLE IF NOT EXISTS ozgata_catalog_pending(chat_id TEXT PRIMARY KEY, user_id TEXT NOT NULL, nonce TEXT NOT NULL, payload TEXT NOT NULL, created_at TEXT NOT NULL)");
+async function refreshCatalog(){
+ await catalogTable;
+ const result=await sqlite.execute("SELECT payload FROM ozgata_catalog_overrides ORDER BY rowid");
+ const all=[...products], positions=new Map(all.map((p,i)=>[p.ubb,i]));
+ for(const r of result.rows){const p=JSON.parse(r.payload),at=positions.get(p.ubb);if(at===undefined){positions.set(p.ubb,all.length);all.push(p);}else all[at]=p;}
+ entries=all.map((p,i)=>({...p,i,n:normalize(p.name),g:normalize(p.group),r:normalize(p.ref)}));
+ byFamily=new Map();for(const p of entries){const f=family(p);byFamily.set(f,[...(byFamily.get(f)||[]),p]);}
+}
+const adminIds=String(Deno.env.get("ADMIN_USER_IDS")||"").split(",").map(x=>x.trim()).filter(Boolean);
+const isAdmin=(id)=>adminIds.includes(String(id));
+const clean=(v)=>String(v??"").trim();
+const key=(v)=>normalize(v).replace(/[^a-z0-9]/g,"");
+function column(headers,needles){return headers.findIndex(h=>needles.some(n=>h.includes(n)));}
+async function parseUpload(bytes,filename){
+ const wb=new ExcelJS.Workbook();await wb.xlsx.load(bytes);
+ for(const sheet of wb.worksheets){
+  let headerRow,cols;
+  for(let i=1;i<=Math.min(sheet.rowCount,15);i++){
+   const values=Array.from({length:Math.min(sheet.columnCount,30)},(_,c)=>key(sheet.getRow(i).getCell(c+1).text));
+   const found={ubb:column(values,["ubb","barkod","gtin","urunno","birincilurunnumarasi","birincilurunnumarasi"]),ref:column(values,["referans","katalogno","malzemekodu"]),name:column(values,["urunadi","urunadi","uruntanimi","etiketadi"]),sut:column(values,["sutkodu","sutkodlari"]),group:column(values,["grup"])};
+   if(found.ubb>=0&&found.ref>=0&&found.name>=0){headerRow=i;cols=found;break;}
+  }
+  if(!headerRow)continue;
+  const out=[];const errors=[];
+  for(let i=headerRow+1;i<=sheet.rowCount;i++){
+   const cell=(col)=>col<0?"":clean(sheet.getRow(i).getCell(col+1).text);
+   let ubb=cell(cols.ubb).replace(/\.0$/,"");const ref=cell(cols.ref),name=cell(cols.name);
+   if(!ubb&&!ref&&!name)continue;
+   if(!/^\d{12,14}$/.test(ubb)||!ref||!name){errors.push(`Satır ${i}: UBB (12–14 rakam), referans veya ürün adı eksik/hatalı.`);continue;}
+   if(/xience\s*pro\s*x/i.test(name)) {errors.push(`Satır ${i}: XIENCE PROx eski listeye alınmaz.`);continue;}
+   const sut=cols.sut<0?"":cell(cols.sut);
+   out.push({ubb,ref,name,sut,group:cell(cols.group),source:`Excel / ${filename.slice(0,80)} / ${sheet.name.slice(0,40)}`});
+   if(out.length>5000)throw new Error("Tek Excel dosyasında en fazla 5000 ürün olabilir.");
+  }
+  return {out,errors,sheet:sheet.name};
+ }
+ throw new Error("UBB, referans ve ürün adı başlıklarını içeren sayfa bulunamadı.");
+}
+async function prepareUpload(chat,user,doc){
+ if(!isAdmin(user))return send(chat,"Ürün listesi yükleme yetkisi yalnızca yöneticiye açık. Kimliğini /kimlik ile görebilirsin.");
+ if(!/\.xlsx$/i.test(doc.file_name||""))return send(chat,"Lütfen .xlsx Excel dosyası yükle.");
+ if(doc.file_size>5_000_000)return send(chat,"Excel dosyası en fazla 5 MB olabilir.");
+ const file=await api("getFile",{file_id:doc.file_id});
+ const download=await fetch(`https://api.telegram.org/file/bot${TOKEN}/${file.file_path}`);
+ if(!download.ok)throw new Error("Excel indirme başarısız");
+ const bytes=new Uint8Array(await download.arrayBuffer());if(bytes.length>5_000_000)throw new Error("Excel 5 MB sınırını aşıyor");
+ let parsed;try{parsed=await parseUpload(bytes,doc.file_name);}catch(err){return send(chat,"Excel okunamadı: "+err.message);}
+ const {out,errors,sheet}=parsed,seen=new Set(),seenRefs=new Map(),existing=new Map(entries.map(p=>[p.ubb,p]));
+ const refs=new Map();for(const p of entries){const k=key(p.ref);if(!refs.has(k))refs.set(k,new Set());refs.get(k).add(p.ubb);}
+ let added=0,changed=0,same=0;const changes=[];
+ for(const p of out){
+  if(seen.has(p.ubb)){errors.push(`Tekrarlanan UBB: ${p.ubb}`);continue;}seen.add(p.ubb);
+  const priorRef=seenRefs.get(key(p.ref));if(priorRef&&priorRef!==p.ubb)errors.push(`Dosyada aynı referans farklı UBB'lerde: ${p.ref}`);seenRefs.set(key(p.ref),p.ubb);
+  const old=existing.get(p.ubb);if(!p.sut&&old)p.sut=old.sut;
+  if(!p.group&&old)p.group=old.group;
+  const other=refs.get(key(p.ref));if(other&&(!old||!other.has(p.ubb)))errors.push(`Referans başka UBB'ye bağlı: ${p.ref} / ${p.ubb}`);
+  if(!old){added++;changes.push(p);}else if(["ref","name","sut","group"].some(k=>clean(old[k])!==clean(p[k]))){changed++;changes.push(p);}else same++;
+ }
+ if(!out.length||errors.length)return send(chat,`⚠️ Yükleme durduruldu. ${out.length} geçerli satır, ${errors.length} sorun.\n${errors.slice(0,10).join("\n")}${errors.length>10?"\n… diğer hataları düzeltip yeniden yükle.":""}`);
+ if(!changes.length)return send(chat,`✅ ${sheet}: ${same} kayıt zaten aynı; değişiklik yok.`);
+ await pendingTable;const nonce=crypto.randomUUID().slice(0,12);
+ await sqlite.execute({sql:"INSERT INTO ozgata_catalog_pending(chat_id,user_id,nonce,payload,created_at) VALUES(?,?,?,?,?) ON CONFLICT(chat_id) DO UPDATE SET user_id=excluded.user_id,nonce=excluded.nonce,payload=excluded.payload,created_at=excluded.created_at",args:[String(chat),String(user),nonce,JSON.stringify(changes),new Date().toISOString()]});
+ return send(chat,`📥 ${doc.file_name} • ${sheet}\nYeni: ${added} | Güncellenecek: ${changed} | Aynı: ${same}\nToplam ${changes.length} değişiklik.\n\n${changes.slice(0,3).map(p=>`${p.ref} — ${p.name.slice(0,70)}`).join("\n")}\n\nOnaylarsan kayıtlar botun kalıcı kataloğuna eklenir.`,markup(row(["✅ Onayla",`import:yes:${nonce}`],["❌ İptal",`import:no:${nonce}`])));
+}
+async function decideUpload(chat,user,data){
+ if(!isAdmin(user))return send(chat,"Bu işlem için yetkin yok.");
+ await pendingTable;const r=await sqlite.execute({sql:"SELECT user_id,nonce,payload,created_at FROM ozgata_catalog_pending WHERE chat_id=?",args:[String(chat)]});const pending=r.rows[0];
+ if(!pending||pending.user_id!==String(user)||pending.nonce!==data.split(":")[2])return send(chat,"Bu yükleme onayı artık geçerli değil.");
+ if(Date.now()-Date.parse(pending.created_at)>30*60_000)return send(chat,"Onay süresi doldu. Excel'i yeniden gönder.");
+ if(data.startsWith("import:no:")){await sqlite.execute({sql:"DELETE FROM ozgata_catalog_pending WHERE chat_id=?",args:[String(chat)]});return send(chat,"Yükleme iptal edildi.");}
+ const changes=JSON.parse(pending.payload);
+ for(const p of changes)await sqlite.execute({sql:"INSERT INTO ozgata_catalog_overrides(ubb,payload,created_at) VALUES(?,?,?) ON CONFLICT(ubb) DO UPDATE SET payload=excluded.payload,created_at=excluded.created_at",args:[p.ubb,JSON.stringify(p),new Date().toISOString()]});
+ await sqlite.execute({sql:"DELETE FROM ozgata_catalog_pending WHERE chat_id=? AND nonce=?",args:[String(chat),pending.nonce]});
+ await refreshCatalog();return send(chat,`✅ ${changes.length} ürün kaydedildi. Ürün adı, UBB veya referansla hemen arayabilirsin.`);
+}
 async function api(method,body) {
  const res=await fetch(API+method,{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify(body)});
  const data=await res.json();if(!data.ok) throw new Error(method+": "+data.description);return data.result;
@@ -205,12 +282,13 @@ export default async function(req){
  if(req.headers.get("X-Telegram-Bot-Api-Secret-Token")!==SECRET)return new Response("Forbidden",{status:403});
  let update;
  try{
-  update=await req.json();const cb=update.callback_query;
+  update=await req.json();await refreshCatalog();const cb=update.callback_query;
   if(cb){
    await api("answerCallbackQuery",{callback_query_id:cb.id});
    const chat=cb.message?.chat?.id;const data=String(cb.data||"");
    if(!chat)return new Response("OK");
-   if(data.startsWith("i:")){
+   if(data.startsWith("import:"))await decideUpload(chat,cb.from?.id,data);
+   else if(data.startsWith("i:")){
     const p=entries[Number(data.slice(2))];
     if(p){const s=await state(chat),chosen=s.selected.includes(p.i);
       await send(chat,`📦 ${p.name}\n\nAile: ${family(p)}\nUBB: ${p.ubb}\nKatalog Ref: ${p.ref}\nSUT: ${p.sut||"Listede belirtilmemiş"}\nKaynak: ${p.source}\n\nBu katalog stok miktarı içermez.`,markup(
@@ -239,7 +317,10 @@ export default async function(req){
    }
   }else if(update.message?.chat?.id){
    const chat=update.message.chat.id;const text=String(update.message.text||"").trim();
-   if(text==="/start"||text==="/yardim")await welcome(chat);
+   if(update.message.document)await prepareUpload(chat,update.message.from?.id,update.message.document);
+   else if(text==="/kimlik")await send(chat,`Telegram kullanıcı kimliğin: ${update.message.from?.id||"bulunamadı"}`);
+   else if(text==="/urunekle")await send(chat,"Ürün eklemek veya güncellemek için UBB, katalog referansı ve ürün adı sütunları bulunan .xlsx dosyasını bu sohbete gönder. Yükleme yalnızca yetkili yöneticiye açıktır; bot önce değişiklikleri gösterir, onaylarsan kaydeder.");
+   else if(text==="/start"||text==="/yardim")await welcome(chat);
    else if(text==="/liste"||text==="/secimler")await selected(chat);
    else if(text==="/excel")await exportList(chat,"all","xlsx");
    else if(text==="/pdf")await exportList(chat,"all","pdf");
@@ -254,4 +335,3 @@ export default async function(req){
   return new Response("OK");
  }
 }
-
