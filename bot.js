@@ -3,7 +3,6 @@ import { sqlite } from "https://esm.town/v/std/sqlite/main.ts";
 import JSZip from "npm:jszip@3.10.1";
 import { PDFDocument, rgb } from "npm:pdf-lib@1.17.1";
 import fontkit from "npm:@pdf-lib/fontkit@1.1.1";
-import ExcelJS from "npm:exceljs@4.4.0";
 
 const TOKEN = Deno.env.get("TELEGRAM_TOKEN");
 const SECRET = Deno.env.get("TELEGRAM_WEBHOOK_SECRET");
@@ -58,28 +57,58 @@ const isAdmin=(id)=>adminIds.includes(String(id));
 const clean=(v)=>String(v??"").trim();
 const key=(v)=>normalize(v).replace(/[^a-z0-9]/g,"");
 function column(headers,needles){return headers.findIndex(h=>needles.some(n=>h.includes(n)));}
+const unxml=(s)=>String(s??"").replace(/&#(x[0-9a-f]+|\d+);|&(amp|lt|gt|quot|apos);/gi,(_,num,named)=>{
+ if(named)return {amp:"&",lt:"<",gt:">",quot:'"',apos:"'"}[named.toLowerCase()];
+ const cp=num[0].toLowerCase()==="x"?parseInt(num.slice(1),16):Number(num);
+ return cp>0&&cp<=0x10ffff?String.fromCodePoint(cp):"";
+});
+const xmlText=(xml)=>unxml([...String(xml).matchAll(/<t\b[^>]*>([\s\S]*?)<\/t>/g)].map(m=>m[1]).join(""));
+const colIndex=(ref)=>{let n=0;for(const c of ref.toUpperCase())n=n*26+c.charCodeAt(0)-64;return n-1;};
+function readSheet(xml,shared){
+ const rows=[];
+ for(const match of xml.matchAll(/<row\b([^>]*?)(?:\/>|>([\s\S]*?)<\/row>)/g)){
+  const r=Number(match[1].match(/\br="(\d+)"/)?.[1]);if(!r||r>100000)continue;
+  const cells=[];
+  for(const c of String(match[2]||"").matchAll(/<c\b([^>]*?)(?:\/>|>([\s\S]*?)<\/c>)/g)){
+   const ref=c[1].match(/\br="([A-Z]+)\d+"/)?.[1],idx=ref?colIndex(ref):-1;
+   if(idx<0||idx>99)continue;
+   const type=c[1].match(/\bt="([^"]+)"/)?.[1],body=c[2]||"";
+   const v=body.match(/<v\b[^>]*>([\s\S]*?)<\/v>/)?.[1];
+   cells[idx]=type==="s"?shared[Number(v)]??"":type==="inlineStr"?xmlText(body):unxml(v??"");
+  }
+  rows[r]=cells;
+ }
+ return rows;
+}
 async function parseUpload(bytes,filename){
- const wb=new ExcelJS.Workbook();await wb.xlsx.load(bytes);
- for(const sheet of wb.worksheets){
+ const zip=await JSZip.loadAsync(bytes);
+ const sharedFile=zip.file("xl/sharedStrings.xml");
+ const sharedXml=sharedFile?await sharedFile.async("string"):"";
+ const shared=[...sharedXml.matchAll(/<si\b[^>]*>([\s\S]*?)<\/si>/g)].map(m=>xmlText(m[1]));
+ const paths=Object.keys(zip.files).filter(p=>/^xl\/worksheets\/sheet\d+\.xml$/.test(p)).sort((a,b)=>Number(a.match(/sheet(\d+)/)[1])-Number(b.match(/sheet(\d+)/)[1]));
+ if(!paths.length)throw new Error("Excel içinde ürün sayfası bulunamadı.");
+ for(const path of paths){
+  const sheet=path.split("/").at(-1).replace(/\.xml$/,"");
+  const rows=readSheet(await zip.file(path).async("string"),shared);
   let headerRow,cols;
-  for(let i=1;i<=Math.min(sheet.rowCount,15);i++){
-   const values=Array.from({length:Math.min(sheet.columnCount,30)},(_,c)=>key(sheet.getRow(i).getCell(c+1).text));
+  for(let i=1;i<=15;i++){
+   const values=Array.from({length:30},(_,c)=>key(rows[i]?.[c]));
    const found={ubb:column(values,["ubb","barkod","gtin","urunno","birincilurunnumarasi","birincilurunnumarasi"]),ref:column(values,["referans","katalogno","malzemekodu"]),name:column(values,["urunadi","urunadi","uruntanimi","etiketadi"]),sut:column(values,["sutkodu","sutkodlari"]),group:column(values,["grup"])};
    if(found.ubb>=0&&found.ref>=0&&found.name>=0){headerRow=i;cols=found;break;}
   }
   if(!headerRow)continue;
   const out=[];const errors=[];
-  for(let i=headerRow+1;i<=sheet.rowCount;i++){
-   const cell=(col)=>col<0?"":clean(sheet.getRow(i).getCell(col+1).text);
+  for(let i=headerRow+1;i<rows.length;i++){
+   const cell=(col)=>col<0?"":clean(rows[i]?.[col]);
    let ubb=cell(cols.ubb).replace(/\.0$/,"");const ref=cell(cols.ref),name=cell(cols.name);
    if(!ubb&&!ref&&!name)continue;
    if(!/^\d{12,14}$/.test(ubb)||!ref||!name){errors.push(`Satır ${i}: UBB (12–14 rakam), referans veya ürün adı eksik/hatalı.`);continue;}
    if(/xience\s*pro\s*x/i.test(name)) {errors.push(`Satır ${i}: XIENCE PROx eski listeye alınmaz.`);continue;}
    const sut=cols.sut<0?"":cell(cols.sut);
-   out.push({ubb,ref,name,sut,group:cell(cols.group),source:`Excel / ${filename.slice(0,80)} / ${sheet.name.slice(0,40)}`});
+   out.push({ubb,ref,name,sut,group:cell(cols.group),source:`Excel / ${filename.slice(0,80)} / ${sheet.slice(0,40)}`});
    if(out.length>5000)throw new Error("Tek Excel dosyasında en fazla 5000 ürün olabilir.");
   }
-  return {out,errors,sheet:sheet.name};
+  return {out,errors,sheet};
  }
  throw new Error("UBB, referans ve ürün adı başlıklarını içeren sayfa bulunamadı.");
 }
