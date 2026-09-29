@@ -1,4 +1,5 @@
 import { products } from "./products.js";
+import { orderExcel, validQuantity } from "./order.js";
 import { sqlite } from "https://esm.town/v/std/sqlite/main.ts";
 import JSZip from "npm:jszip@3.10.1";
 import { PDFDocument, rgb } from "npm:pdf-lib@1.17.1";
@@ -58,14 +59,18 @@ const buttons=(items)=>({inline_keyboard:items.map(x=>[x])});
 const send=(chat_id,text,reply_markup)=>api("sendMessage",{chat_id,text,reply_markup,link_preview_options:{is_disabled:true}});
 const PER_PAGE=7;
 const stateTable=sqlite.execute("CREATE TABLE IF NOT EXISTS ozgata_catalog_state_v3(chat_id TEXT PRIMARY KEY, results TEXT NOT NULL, selected TEXT NOT NULL, page INTEGER NOT NULL)");
+const orderTable=sqlite.execute("CREATE TABLE IF NOT EXISTS ozgata_order_state_v1(chat_id TEXT PRIMARY KEY, quantities TEXT NOT NULL, awaiting TEXT NOT NULL, order_no TEXT NOT NULL)");
 async function state(chat){
- await stateTable;
+ await stateTable;await orderTable;
  const r=await sqlite.execute({sql:"SELECT results,selected,page FROM ozgata_catalog_state_v3 WHERE chat_id=?",args:[String(chat)]});
- const row=r.rows[0];return row?{results:JSON.parse(row.results),selected:JSON.parse(row.selected),page:Number(row.page)}:{results:[],selected:[],page:0};
+ const orders=await sqlite.execute({sql:"SELECT quantities,awaiting,order_no FROM ozgata_order_state_v1 WHERE chat_id=?",args:[String(chat)]});
+ const row=r.rows[0],o=orders.rows[0];return {...(row?{results:JSON.parse(row.results),selected:JSON.parse(row.selected),page:Number(row.page)}:{results:[],selected:[],page:0}),quantities:o?JSON.parse(o.quantities):{},awaiting:o?.awaiting||"",orderNo:o?.order_no||""};
 }
 async function saveState(chat,s){
  await stateTable;
  await sqlite.execute({sql:"INSERT INTO ozgata_catalog_state_v3(chat_id,results,selected,page) VALUES(?,?,?,?) ON CONFLICT(chat_id) DO UPDATE SET results=excluded.results,selected=excluded.selected,page=excluded.page",args:[String(chat),JSON.stringify(s.results),JSON.stringify(s.selected),s.page]});
+ await orderTable;
+ await sqlite.execute({sql:"INSERT INTO ozgata_order_state_v1(chat_id,quantities,awaiting,order_no) VALUES(?,?,?,?) ON CONFLICT(chat_id) DO UPDATE SET quantities=excluded.quantities,awaiting=excluded.awaiting,order_no=excluded.order_no",args:[String(chat),JSON.stringify(s.quantities||{}),s.awaiting||"",s.orderNo||""]});
 }
 const e=(i)=>entries[i];
 const row=(...items)=>items.map(([text,callback_data])=>({text,callback_data}));
@@ -77,18 +82,19 @@ async function document(chat,filename,bytes,mime,caption){
  if(!data.ok)throw new Error("sendDocument: "+data.description);
 }
 const esc=(s)=>String(s??"").replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;").replace(/'/g,"&apos;").replace(/[\x00-\x08\x0b\x0c\x0e-\x1f]/g,"");
-async function excel(items){
+async function excel(items,audience="internal"){
  const zip=new JSZip();const fields=["Kategori","Model","Ölçü","Ürün Adı","UBB","Katalog Referansı","SUT Kodları","Marka","DMO","Açıklama","Açıklama 2","Kontrol Notu","Sık Kullanılan"];
- const lines=[fields,...items.map(p=>[family(p),model(p),measurement(p),p.name,p.ubb,p.ref,p.sut||p.sutStatus||"Belirtilmemiş",p.brand,p.dmo,p.description,p.description2,p.note,p.preferred?"Evet":""])];
+ const hospital=audience==="hospital";
+ const lines=hospital?[["UBB","Referans","SUT","Marka","Ürün Adı"],...items.map(p=>[p.ubb,p.ref,p.sut||p.sutStatus||"Belirtilmemiş",p.brand,p.name])]:[fields,...items.map(p=>[family(p),model(p),measurement(p),p.name,p.ubb,p.ref,p.sut||p.sutStatus||"Belirtilmemiş",p.brand,p.dmo,p.description,p.description2,p.note,p.preferred?"Evet":""])];
  const xml=`<?xml version="1.0" encoding="UTF-8" standalone="yes"?><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetViews><sheetView workbookViewId="0"><pane ySplit="1" topLeftCell="A2" activePane="bottomLeft" state="frozen"/></sheetView></sheetViews><cols><col min="1" max="3" width="24" customWidth="1"/><col min="4" max="4" width="65" customWidth="1"/><col min="5" max="9" width="24" customWidth="1"/><col min="10" max="12" width="55" customWidth="1"/><col min="13" max="13" width="18" customWidth="1"/></cols><sheetData>${lines.map((line,i)=>`<row r="${i+1}">${line.map((val,j)=>`<c r="${"ABCDEFGHIJKLM"[j]}${i+1}" t="inlineStr"><is><t>${esc(val)}</t></is></c>`).join("")}</row>`).join("")}</sheetData><autoFilter ref="A1:M${lines.length}"/></worksheet>`;
  zip.file("[Content_Types].xml",`<?xml version="1.0" encoding="UTF-8"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/><Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/></Types>`);
  zip.file("_rels/.rels",`<?xml version="1.0" encoding="UTF-8"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/></Relationships>`);
  zip.file("xl/workbook.xml",`<?xml version="1.0" encoding="UTF-8"?><workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets><sheet name="Ürün Listesi" sheetId="1" r:id="rId1"/></sheets></workbook>`);
  zip.file("xl/_rels/workbook.xml.rels",`<?xml version="1.0" encoding="UTF-8"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/></Relationships>`);
- zip.file("xl/worksheets/sheet1.xml",xml);
+ zip.file("xl/worksheets/sheet1.xml",hospital?xml.replace(/<cols>[\s\S]*?<\/cols>/,`<cols><col min="1" max="4" width="24" customWidth="1"/><col min="5" max="5" width="75" customWidth="1"/></cols>`).replace(`A1:M${lines.length}`,`A1:E${lines.length}`):xml);
  return await zip.generateAsync({type:"uint8array",compression:"DEFLATE"});
 }
-async function pdf(items,title){
+async function pdf(items,title,audience="internal"){
  const pdf=await PDFDocument.create();pdf.registerFontkit(fontkit);
  const response=await fetch(new URL("./font.ttf",import.meta.url));if(!response.ok)throw new Error("PDF font indirilemedi");
  const font=await pdf.embedFont(await response.arrayBuffer(),{subset:true});
@@ -103,7 +109,7 @@ async function pdf(items,title){
  function newPage(){page=pdf.addPage([842,595]);pageNo++;y=550;page.drawRectangle({x:0,y:565,width:842,height:30,color:rgb(.08,.16,.28)});page.drawText("ÖZGATA | "+title,{x:30,y:575,font,size:12,color:rgb(1,1,1)});page.drawText(String(pageNo),{x:795,y:20,font,size:8});}
  newPage();
  for(const [index,p] of items.entries()){
-  const texts=[`${index+1}. ${model(p)} | ${measurement(p)} | ${variant(p)}${p.preferred?" | Sık kullanılan":""}`,p.name,`UBB: ${p.ubb} | Ref: ${p.ref} | SUT: ${p.sut||p.sutStatus||"Belirtilmemiş"}`,`Marka: ${p.brand||"Belirtilmemiş"}${p.dmo?" | DMO: "+p.dmo:""}`,p.description,p.description2,p.note?"Kontrol notu: "+p.note:""];
+  const texts=audience==="hospital"?[`${index+1}. ${p.name}`,`UBB: ${p.ubb} | Ref: ${p.ref} | SUT: ${p.sut||p.sutStatus||"Belirtilmemiş"}`,`Marka: ${p.brand||"Belirtilmemiş"}`]:[`${index+1}. ${model(p)} | ${measurement(p)} | ${variant(p)}${p.preferred?" | Sık kullanılan":""}`,p.name,`UBB: ${p.ubb} | Ref: ${p.ref} | SUT: ${p.sut||p.sutStatus||"Belirtilmemiş"}`,`Marka: ${p.brand||"Belirtilmemiş"}${p.dmo?" | DMO: "+p.dmo:""}`,p.description,p.description2,p.note?"Kontrol notu: "+p.note:""];
   const lines=texts.filter(Boolean).flatMap(t=>wrap(t,750));const height=lines.length*12+12;
   if(y-height<40)newPage();
   if(index%2===0)page.drawRectangle({x:25,y:y-height+6,width:790,height,color:rgb(.95,.97,.99)});
@@ -180,15 +186,16 @@ async function showPage(chat,page=0){
  if(s.page+1<total)nav.push(["Sonraki ➡️",`pg:${s.page+1}`]);if(nav.length)rows.push(row(...nav));
  rows.push(row([`📋 Seçilenler (${s.selected.length})`,"selected"],["📄 Tümünü listele","list:all"]));
  rows.push(row(["📊 Excel","export:all:xlsx"],["📕 PDF","export:all:pdf"]));
- rows.push(row(["🔎 Yeni arama","home"]));
+ rows.push(row(["📦 Abbott siparişim","order:0"],["🔎 Yeni arama","home"]));
  return send(chat,`🔎 ${s.results.length} ürün bulundu\nSayfa ${s.page+1}/${total} • Gösterilen ${s.page*PER_PAGE+1}–${s.page*PER_PAGE+shown.length}\nBir ürüne dokunup ayrıntısını gör ve seç.`,markup(...rows));
 }
 async function welcome(chat,note=""){
- return send(chat,`${note?note+"\n\n":""}👋 ÖZGATABOT | Ürün Bilgi Merkezi\n\nÜrün adı, ölçü, UBB, katalog referansı veya SUT kodu yaz. Boşluksuz yazım ve küçük ad hataları da aranır.\n\n🔎 Örnek: pilot50 • 2.5x18 PROA • KR1088\n📌 Ürüne dokunup seçebilir, seçtiklerini listeleyebilir veya tüm sonuçları Excel/PDF olarak alabilirsin.\n\n⭐ Sık kullandığımız seçenekler önce gösterilir.\nKatalog v3 • 936 ürün\n\nHangi gruba bakalım?`,markup(
+ const s=await state(chat);if(s.awaiting){s.awaiting="";await saveState(chat,s);}
+ return send(chat,`${note?note+"\n\n":""}👋 ÖZGATABOT | Ürün Bilgi Merkezi\n\nÜrün adı, ölçü, UBB, katalog referansı veya SUT kodu yaz. Boşluksuz yazım ve küçük ad hataları da aranır.\n\n🔎 Örnek: pilot50 • 2.5x18 PROA • KR1088\n📌 Ürünü seç, sipariş için miktarını yaz. Siparişim menüsünde listeyi düzenleyip Abbott Excel’i alabilirsin.\n🏥 Ürün Excel/PDF çıktısında hastane veya kendim için seçeneğini kullan.\n\n⭐ Sık kullandığımız seçenekler önce gösterilir.\nKatalog v4 • 936 ürün • Sipariş\n\nHangi gruba bakalım?`,markup(
   row(["🫀 Stent","group:stent"],["🎈 Balon","group:balon"]),
   row(["〰️ Kılavuz tel","group:tel"],["📋 Seçilenler","selected"]),
   row(["🧩 Diğer ürünler","group:diger"],["📚 936 ürün","allproducts"]),
-  row(["➡️ Seçmeden ara","skip"])
+  row(["📦 Abbott siparişim","order:0"],["➡️ Seçmeden ara","skip"])
  ));
 }
 async function group(chat,kind){
@@ -203,11 +210,11 @@ async function group(chat,kind){
 }
 async function selected(chat){
  const s=await state(chat);if(!s.selected.length)return send(chat,"Henüz ürün seçmedin. Arama yapıp ürüne dokun, sonra ✅ Seç düğmesine bas.",markup(row(["🔎 Ara","home"],["➡️ Geç","skip"])));
- const names=s.selected.slice(0,20).map((id,i)=>`${i+1}. ${shortName(e(id))}`).join("\n");
+ const names=s.selected.slice(0,20).map((id,i)=>`${i+1}. ${shortName(e(id))}${validQuantity(quantityOf(s,e(id)))?" — "+quantityOf(s,e(id))+" adet":""}`).join("\n");
  const more=s.selected.length>20?`\n…ve ${s.selected.length-20} ürün daha. Tümünü dosya olarak alabilirsin.`:"";
  return send(chat,`📋 Seçilenler (${s.selected.length})\n${names}${more}`,markup(
   row(["📊 Seçilenleri Excel","export:selected:xlsx"],["📕 Seçilenleri PDF","export:selected:pdf"]),
-  row(["📄 Seçilenleri listele","list:selected"]),
+  row(["📄 Seçilenleri listele","list:selected"],["📦 Abbott siparişim","order:0"]),
   row(["🗑 Seçimleri temizle","clear"],["⬅️ Sonuçlara dön","back"])
  ));
 }
@@ -222,10 +229,83 @@ async function textList(chat,scope,page=0){
 async function exportList(chat,scope,format){
  const s=await state(chat),ids=scope==="selected"?s.selected:s.results;
  if(!ids.length)return send(chat,"Çıktı için önce ürün ara veya seç.");
- const items=ids.map(e);const title=scope==="selected"?"Seçilen ürünler":"Arama sonuçları";
+ s.awaiting="";await saveState(chat,s);
+ return send(chat,`${format.toUpperCase()} dosyası kimin için?`,markup(
+  row(["🏥 Hastane için",`audience:${scope}:${format}:hospital`],["👤 Kendim için",`audience:${scope}:${format}:internal`]),
+  row(["⬅️ Geri",scope==="selected"?"selected":"back"])));
+}
+async function sendExport(chat,scope,format,audience){
+ const s=await state(chat),ids=scope==="selected"?s.selected:s.results;
+ if(!ids.length)return send(chat,"Liste boş. Önce ürün ara veya seç.");
+ const items=ids.map(e),title=audience==="hospital"?"Ürün listesi":scope==="selected"?"Seçilen ürünler":"Arama sonuçları";
  await send(chat,`⏳ ${items.length} ürün için ${format.toUpperCase()} hazırlanıyor…`);
- const bytes=format==="xlsx"?await excel(items):await pdf(items,title);
- await document(chat,`OZGATA_${scope}_${new Date().toISOString().slice(0,10)}.${format}`,bytes,format==="xlsx"?"application/vnd.openxmlformats-officedocument.spreadsheetml.sheet":"application/pdf",`${title} • ${items.length} kayıt`);
+ const bytes=format==="xlsx"?await excel(items,audience):await pdf(items,title,audience);
+ await document(chat,`OZGATA_${audience}_${new Date().toISOString().slice(0,10)}.${format}`,bytes,format==="xlsx"?"application/vnd.openxmlformats-officedocument.spreadsheetml.sheet":"application/pdf",`${title} • ${items.length} kayıt`);
+}
+function quantityOf(s,p){return s.quantities[p.ref];}
+async function beginQuantity(chat,id){
+ const p=e(id),s=await state(chat);if(!p||!s.selected.includes(id))return send(chat,"Önce ürünü seç.");
+ s.awaiting=p.ref;await saveState(chat,s);
+ return send(chat,`📦 ${shortName(p)}\n\n${validQuantity(quantityOf(s,p))?"Mevcut miktar: "+quantityOf(s,p)+" adet\n":""}Sipariş miktarını adet olarak yaz. Örneğin: 5\nYeni miktar mevcut miktarın yerine geçer.`,markup(
+  row(["1 adet",`setq:${id}:1`],["5 adet",`setq:${id}:5`],["10 adet",`setq:${id}:10`]),row(["➡️ Miktarı sonra gir","cancelqty"])));
+}
+async function setQuantity(chat,id,value){
+ const p=e(id),s=await state(chat);
+ if(!p||!s.selected.includes(id)||s.awaiting!==p.ref)return send(chat,"Bu miktar seçimi artık etkin değil. Sipariş menüsünden ürünü yeniden seç.",markup(row(["📦 Siparişim","order:0"])));
+ if(!validQuantity(value))return send(chat,"Miktar 1–100000 arasında tam sayı olmalı. Ondalık veya sıfır miktar girme.");
+ s.quantities[p.ref]=value;s.awaiting="";await saveState(chat,s);
+ return send(chat,`✅ ${model(p)} • ${measurement(p)}\nRef: ${p.ref}\nMiktar: ${value} adet`,markup(row(["🔎 Ürün ekle","home"],["⬅️ Sonuçlara dön","back"]),row(["📦 Siparişim","order:0"])));
+}
+async function removeOrderItem(chat,id){
+ const s=await state(chat),p=e(id);if(!p)return;
+ s.selected=s.selected.filter(x=>x!==id);delete s.quantities[p.ref];if(s.awaiting===p.ref)s.awaiting="";
+ await saveState(chat,s);return showOrder(chat,0);
+}
+async function showOrder(chat,page=0){
+ const s=await state(chat);if(!s.selected.length)return send(chat,"Sipariş listesi boş. Bir ürün ara, seç ve miktarını gir.",markup(row(["🔎 Ürün ekle","home"])));
+ const totalPages=Math.ceil(s.selected.length/8);page=Number.isFinite(page)?Math.max(0,Math.min(page,totalPages-1)):0;
+ const ids=s.selected.slice(page*8,page*8+8),missing=s.selected.filter(id=>!validQuantity(quantityOf(s,e(id)))).length;
+ const total=s.selected.reduce((sum,id)=>sum+(validQuantity(quantityOf(s,e(id)))?quantityOf(s,e(id)):0),0);
+ const lines=ids.map((id,i)=>`${page*8+i+1}. ${shortName(e(id))}\n   Miktar: ${validQuantity(quantityOf(s,e(id)))?quantityOf(s,e(id))+" adet":"GİRİLMEDİ"}`);
+ const rows=ids.map((id,i)=>row([`${page*8+i+1}. Miktarı değiştir`,`qty:${id}`],[`${page*8+i+1}. Çıkar`,`remove:${id}`]));
+ const nav=[];if(page>0)nav.push(["⬅️ Önceki",`order:${page-1}`]);if(page+1<totalPages)nav.push(["Sonraki ➡️",`order:${page+1}`]);if(nav.length)rows.push(row(...nav));
+ rows.push(row(["📄 Hepsini listele","orderall"],["📊 Sipariş Excel'i","orderexport"]),row(["✏️ Sipariş numarası","orderno"],["🔎 Ürün ekle","home"]),row(["🗑 Siparişi temizle","orderclearask"]));
+ return send(chat,`📦 ABBOTT SİPARİŞİ\nSipariş no: ${s.orderNo||"Belirtilmedi"}\n${s.selected.length} kalem • ${total} adet${missing?" • "+missing+" kalemde miktar eksik":""}\nSayfa ${page+1}/${totalPages}\n\n${lines.join("\n\n")}`,markup(...rows));
+}
+async function allOrderLines(chat){
+ const s=await state(chat);if(!s.selected.length)return showOrder(chat);
+ let chunk="📦 ABBOTT SİPARİŞ LİSTESİ\n";
+ for(const [i,id] of s.selected.entries()){
+  const p=e(id),line=`${i+1}. ${shortName(p)} — ${validQuantity(quantityOf(s,p))?quantityOf(s,p)+" adet":"Miktar eksik"}\n`;
+  if(chunk.length+line.length>3500){await send(chat,chunk);chunk="";}chunk+=line;
+ }
+ return send(chat,chunk,markup(row(["📊 Sipariş Excel'i","orderexport"],["✏️ Düzenle","order:0"])));
+}
+async function askOrderNo(chat,exportAfter=false){
+ const s=await state(chat);s.awaiting=exportAfter?"@orderExport":"@orderNo";await saveState(chat,s);
+ return send(chat,"Sipariş numarasını veya adını yaz. En fazla 60 karakter.",markup(row(["Numarasız devam",exportAfter?"ordernoneexport":"ordernone"])));
+}
+async function exportOrder(chat,allowNo=false){
+ const s=await state(chat);if(!s.selected.length)return showOrder(chat);
+ const missing=s.selected.find(id=>!validQuantity(quantityOf(s,e(id))));
+ if(missing!==undefined){await send(chat,"Excel oluşturmadan önce seçili ürünlerin tüm miktarlarını tamamla.");return beginQuantity(chat,missing);}
+ if(!s.orderNo&&!allowNo)return askOrderNo(chat,true);
+ const items=s.selected.map(id=>({...e(id),quantity:quantityOf(s,e(id))}));
+ const bytes=await orderExcel(items,s.orderNo);
+ await document(chat,`OZGATA_ABBOTT_SIPARIS_${new Date().toISOString().slice(0,10)}.xlsx`,bytes,"application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",`Abbott sipariş listesi • ${items.length} kalem • ${items.reduce((sum,p)=>sum+p.quantity,0)} adet`);
+ return send(chat,"Sipariş Excel'in hazır. Göndermeden önce listeyi kontrol edebilirsin.",markup(row(["📦 Siparişi görüntüle","order:0"],["🔎 Ürün ekle","home"])));
+}
+async function pendingInput(chat,text){
+ const s=await state(chat);if(!s.awaiting)return false;
+ if(s.awaiting.startsWith("@order")){
+  if(!text.trim()||text.length>60){await send(chat,"Sipariş numarası/adı 1–60 karakter olmalı.");return true;}
+  const after=s.awaiting==="@orderExport";s.orderNo=text.trim();s.awaiting="";await saveState(chat,s);
+  if(after)await exportOrder(chat);else await showOrder(chat);return true;
+ }
+ const p=entries.find(p=>p.ref===s.awaiting);
+ if(!p){s.awaiting="";await saveState(chat,s);return false;}
+ if(!/^\d+$/.test(text)){await send(chat,"Bu ürün için adet bekliyorum. Örneğin 5 yaz; vazgeçmek için /iptal kullan.");return true;}
+ await setQuantity(chat,p.i,Number(text));return true;
 }
 async function allProducts(chat){const s=await state(chat);s.results=[...entries].sort((a,b)=>Number(b.preferred)-Number(a.preferred)).map(p=>p.i);s.page=0;await saveState(chat,s);return showPage(chat,0);}
 async function search(chat,q){
@@ -243,7 +323,7 @@ async function search(chat,q){
  return showPage(chat,0);
 }
 export default async function(req){
- if(req.method==="GET")return new Response("ÖZGATA katalog v3 • 936 ürün • 2026-09-29");
+ if(req.method==="GET")return new Response("ÖZGATA katalog v4 • 936 ürün • Sipariş • 2026-09-29");
  if(req.method!=="POST")return new Response("Method Not Allowed",{status:405});
  if(req.headers.get("X-Telegram-Bot-Api-Secret-Token")!==SECRET)return new Response("Forbidden",{status:403});
  let update;
@@ -253,17 +333,31 @@ export default async function(req){
    await api("answerCallbackQuery",{callback_query_id:cb.id});
    const chat=cb.message?.chat?.id;const data=String(cb.data||"");
    if(!chat)return new Response("OK");
-   if(data.startsWith("i3:")){
+   if(["home","back","skip","selected","order:0"].includes(data)){const s=await state(chat);s.awaiting="";await saveState(chat,s);}
+   if(data.startsWith("qty:"))await beginQuantity(chat,Number(data.slice(4)));
+   else if(data.startsWith("setq:")){const [,id,value]=data.split(":");await setQuantity(chat,Number(id),Number(value));}
+   else if(data.startsWith("remove:"))await removeOrderItem(chat,Number(data.slice(7)));
+   else if(data.startsWith("order:"))await showOrder(chat,Number(data.slice(6)));
+   else if(data==="orderall")await allOrderLines(chat);
+   else if(data==="orderexport")await exportOrder(chat);
+   else if(data==="orderno")await askOrderNo(chat);
+   else if(data==="ordernone"||data==="ordernoneexport"){const s=await state(chat);s.orderNo="";s.awaiting="";await saveState(chat,s);if(data==="ordernoneexport")await exportOrder(chat,true);else await showOrder(chat);}
+   else if(data==="cancelqty"){const s=await state(chat);s.awaiting="";await saveState(chat,s);await send(chat,"Ürün seçili kaldı. Miktarını Siparişim menüsünden girebilirsin.",markup(row(["📦 Siparişim","order:0"],["🔎 Ara","home"])));}
+   else if(data==="orderclearask")await send(chat,"Seçili ürünler ve sipariş miktarları temizlensin mi?",markup(row(["Evet, temizle","orderclear"],["Vazgeç","order:0"])));
+   else if(data==="orderclear"){const s=await state(chat);s.selected=[];s.quantities={};s.awaiting="";s.orderNo="";await saveState(chat,s);await showOrder(chat);}
+   else if(data.startsWith("audience:")){const [,scope,format,audience]=data.split(":");if(["all","selected"].includes(scope)&&["xlsx","pdf"].includes(format)&&["hospital","internal"].includes(audience))await sendExport(chat,scope,format,audience);}
+   else if(data.startsWith("i3:")){
     const p=entries[Number(data.slice(3))];
     if(p){const s=await state(chat),chosen=s.selected.includes(p.i);
       await send(chat,`📦 ${shortName(p)}\n\nÜrün: ${p.name}\nKategori: ${family(p)}\nÖlçü: ${measurement(p)||"Listede belirtilmemiş"}\nUBB: ${p.ubb}\nKatalog Ref: ${p.ref}\nSUT: ${p.sut||p.sutStatus||"Listede belirtilmemiş"}\nMarka: ${p.brand||"Listede belirtilmemiş"}${p.dmo?"\nDMO: "+p.dmo:""}${p.description?"\n\nAçıklama: "+p.description:""}${p.description2?"\n"+p.description2:""}${p.sutName?"\nSUT açıklaması: "+p.sutName:""}${p.note?"\n\n⚠️ Kontrol notu: "+p.note:""}`,markup(
        row([chosen?"❎ Seçimden çıkar":"✅ Seç",`pick3:${p.i}`],["➡️ Geç",`pg:${s.page}`]),
+       ...(chosen?[row(["🔢 Sipariş miktarı",`qty:${p.i}`])]:[]),
        row([`📋 Seçilenler (${s.selected.length})`,"selected"],["⬅️ Sonuçlara dön","back"])
       ));}
    }else if(data.startsWith("pick3:")){
     const id=Number(data.slice(6)),s=await state(chat);if(!entries[id])return new Response("OK");
-    s.selected=s.selected.includes(id)?s.selected.filter(x=>x!==id):[...s.selected,id];await saveState(chat,s);
-    await send(chat,`${s.selected.includes(id)?"✅ Listeye eklendi":"❎ Listeden çıkarıldı"}: ${shortName(e(id))}`,markup(row(["➡️ Devam",`pg:${s.page}`],["📋 Seçilenler","selected"])));
+    if(s.selected.includes(id)){s.selected=s.selected.filter(x=>x!==id);delete s.quantities[e(id).ref];if(s.awaiting===e(id).ref)s.awaiting="";await saveState(chat,s);await send(chat,"Ürün seçimden çıkarıldı.",markup(row(["⬅️ Sonuçlar","back"],["📦 Siparişim","order:0"])));}
+    else{s.selected.push(id);await saveState(chat,s);await beginQuantity(chat,id);}
    }else if(data.startsWith("pg:"))await showPage(chat,Number(data.slice(3)));
    else if(data.startsWith("fam:")){
     const name=data.slice(4),items=byFamily.get(name)||[];const s=await state(chat);
@@ -275,7 +369,7 @@ export default async function(req){
    else if(data==="back")await showPage(chat,(await state(chat)).page);
    else if(data==="selected")await selected(chat);
    else if(data==="clear"){
-    const s=await state(chat);s.selected=[];await saveState(chat,s);await selected(chat);
+    const s=await state(chat);s.selected=[];s.quantities={};s.awaiting="";s.orderNo="";await saveState(chat,s);await selected(chat);
    }else if(data.startsWith("list:")){
     const [,scope,page]=data.split(":");await textList(chat,scope,Number(page||0));
    }else if(data.startsWith("export:")){
@@ -283,7 +377,12 @@ export default async function(req){
    }
   }else if(update.message?.chat?.id){
    const chat=update.message.chat.id;const text=String(update.message.text||"").trim();
-   if(update.message.document)await send(chat,"Bu sürümde onaylı ürün kataloğu kullanılıyor. Dosyadan talep okuma henüz etkin değil. Ürün adı, ölçü, UBB veya referans yazabilirsin.");
+   if(text==="/iptal"){const s=await state(chat);s.awaiting="";await saveState(chat,s);await welcome(chat,"Miktar/numara girişi iptal edildi.");}
+   else if(text&&!text.startsWith("/")&&await pendingInput(chat,text)){}
+   else if(text==="/siparis")await showOrder(chat);
+   else if(text==="/siparisexcel")await exportOrder(chat);
+   else if(text==="/siparisno")await askOrderNo(chat);
+   else if(update.message.document)await send(chat,"Bu sürümde onaylı ürün kataloğu kullanılıyor. Dosyadan talep okuma henüz etkin değil. Ürün adı, ölçü, UBB veya referans yazabilirsin.");
    else if(text==="/kimlik")await send(chat,`Telegram kullanıcı kimliğin: ${update.message.from?.id||"bulunamadı"}`);
    else if(text==="/urunler")await allProducts(chat);
    else if(text==="/start"||text==="/yardim")await welcome(chat);
